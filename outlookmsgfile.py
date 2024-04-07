@@ -1,3 +1,5 @@
+#! /usr/bin/env python
+
 # This module converts a Microsoft Outlook .msg file into
 # a MIME message that can be loaded by most email programs
 # or inspected in a text editor.
@@ -25,7 +27,7 @@ from email.utils import parsedate_to_datetime, formatdate, formataddr
 
 import compoundfiles
 from rtfparse.parser import Rtf_Parser
-from rtfparse.renderers.de_encapsulate_html import De_encapsulate_HTML
+from rtfparse.renderers.html_decapsulator import HTML_Decapsulator
 import html2text
 
 logger = logging.getLogger(__name__)
@@ -129,7 +131,7 @@ def load_message_stream(entry, is_top_level, doc):
       rtf_blob = io.BytesIO(rtf)
       parsed = Rtf_Parser(rtf_file=rtf_blob).parse_file()
       html_stream = io.StringIO()
-      De_encapsulate_HTML().render(parsed, html_stream)
+      HTML_Decapsulator().render(parsed, html_stream)
       html_body = html_stream.getvalue()
 
       if not has_body:
