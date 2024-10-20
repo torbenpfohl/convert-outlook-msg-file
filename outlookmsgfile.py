@@ -945,5 +945,5 @@ if __name__ == "__main__":
     for fn in sys.argv[1:]:
       print(fn + "...")
       msg = load(fn)
-      with open(fn + ".eml", "wb") as f:
+      with open(fn.removesuffix(".msg") + ".eml", "wb") as f:
         f.write(msg.as_bytes())
