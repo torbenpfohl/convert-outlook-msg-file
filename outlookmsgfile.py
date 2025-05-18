@@ -19,6 +19,7 @@ import logging
 import os
 import sys
 import io
+from base64 import b64decode
 
 from functools import reduce
 
@@ -31,6 +32,7 @@ from rtfparse.renderers.html_decapsulator import HTML_Decapsulator
 import html2text
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(filename="logger.log", encoding="utf-8", level=logging.DEBUG)
 
 FALLBACK_ENCODING = 'cp1252'
 
@@ -198,7 +200,8 @@ def process_attachment(msg, entry, doc):
   mime_type = props.get('ATTACH_MIME_TAG', 'application/octet-stream')
   if isinstance(mime_type, bytes): mime_type = mime_type.decode("utf8")
 
-  filename = os.path.basename(filename)
+  if filename is not None:
+    filename = os.path.basename(filename)
 
   # Python 3.6.
   if isinstance(blob, str):
@@ -206,10 +209,19 @@ def process_attachment(msg, entry, doc):
       blob,
       filename=filename)
   elif isinstance(blob, bytes):
-    msg.add_attachment(
-      blob,
-      maintype=mime_type.split("/", 1)[0], subtype=mime_type.split("/", 1)[-1],
-      filename=filename)
+    if filename == None and mime_type == "multipart/signed":
+      raw_attachments = extract_from_signed_attachment(blob, boundaries=list(), raw_attachments=list())
+      for filename, data in raw_attachments:
+        msg.add_attachment(
+          data,
+          maintype="application", subtype="octet-stream",
+          filename=filename,
+        )
+    else:
+      msg.add_attachment(
+        blob,
+        maintype=mime_type.split("/", 1)[0], subtype=mime_type.split("/", 1)[-1],
+        filename=filename)
   else: # a Message instance
     msg.add_attachment(
       blob,
@@ -322,6 +334,87 @@ def parse_properties(properties, is_top_level, container, doc):
 
   return properties
 
+
+def extract_from_signed_attachment(blob: bytes, start: int = 0, end: int = -1, boundaries: list[dict] = None, raw_attachments: list = None):
+  EMPTY_LINE = b"\r\n\r\n"
+  raw_content_type, _, _ = blob[start:end].lstrip().partition(EMPTY_LINE)
+  raw_content_type = raw_content_type.decode("ascii")
+  raw_content_type = re.sub(r"\r\n\s", "", raw_content_type)
+  boundary = content_disposition = content_type = filename = None
+  for line in raw_content_type.split("\r\n"):
+    # Content-Type.
+    if line.lower().startswith("content-type:"):
+      for param in line.split(";"):
+        param = param.strip()
+        # Content-Type
+        if param.lower().startswith("content-type:"):
+          _, _, content_type = param.partition(":")
+          content_type = content_type.strip(" ;").lower()
+        # Boundary-Name
+        if param.lower().startswith("boundary"):
+          _, _, boundary = param.partition("=")
+          boundary = boundary.strip("\"")
+          boundary = boundary.encode("ascii")
+          boundary_start = b"--"+boundary
+          boundary_end = b"--"+boundary+b"--"
+    # Content-Disposition incl. filename.
+    if line.lower().startswith("content-disposition:"):
+      raw_content_disposition, _, raw_filename = line.partition(";")
+      _, _, content_disposition = raw_content_disposition.partition(":")
+      content_disposition = content_disposition.strip()
+      _, _, filename = raw_filename.partition("=")
+      filename = filename.strip("\"")
+    if line.lower().startswith("content-transfer-encoding:"):
+      _, _, content_transfer_encoding = line.partition(":")
+      content_transfer_encoding = content_transfer_encoding.strip()
+  # Found 'boundary'-parameter in Content-Type.
+  if boundary != None:
+    start = blob.find(boundary_start)
+    end = blob.find(boundary_end) - 1
+    boundary_obj = {
+      "start_word": boundary_start,    # e.g. "--=_mixed 0123456789_="
+      "end_word": boundary_end,        # e.g. "--=_mixed 0123456789_=--"
+      "start": start,                  # includes the first character from start_word
+      "end": end,                      # ends on the character just BEFORE end_word starts
+    }
+    boundaries.append(boundary_obj)
+    return extract_from_signed_attachment(blob, start, end, boundaries, raw_attachments)
+  # If 'boundary' wasn't found, we have a normal message.
+  elif content_type != None:
+    current_boundary = boundaries[-1]
+    next_start = blob.find(current_boundary.get("start_word"), start+len(current_boundary.get("start_word")))
+    if next_start >= current_boundary.get("end"):    # Current boundary is finished.
+      block_end = current_boundary.get("end") + 1
+      boundaries.pop()
+    else:
+      block_end = next_start
+    if content_disposition == "attachment":
+      # Process attachment
+      _, _, attachment = blob[start:block_end].partition(EMPTY_LINE)
+      if attachment.endswith(EMPTY_LINE):
+        attachment = attachment.removesuffix(EMPTY_LINE) + b"\r\n"
+      attachment = b64decode(attachment)
+      # Process specialcase-filename (RFC 2047)
+      if special_filename := re.match(r"=\?((?P<charset>.*)\?(?P<enc>.*)\?(?P<text>.*))\?=", filename):
+        charset = special_filename.group("charset")  # important? chr() uses unicode.
+        enc = special_filename.group("enc")
+        text = special_filename.group("text")
+        if enc.lower() == "q":
+          text = text.replace("_", " ")
+          text = re.sub(r"=[0-9A-Fa-f]{2}", lambda m: chr(int(m.group().removeprefix("="), base=16)), text)
+          filename = text
+      raw_attachments.append((filename, attachment))
+    if len(boundaries) > 0:
+      next_boundary = boundaries[-1]
+      next_start = next_start + len(current_boundary.get("end_word"))
+      end = next_boundary.get("end")
+      return extract_from_signed_attachment(blob, next_start, end, boundaries, raw_attachments)
+    else:
+      return raw_attachments
+  else:
+    print("error")
+    return raw_attachments
+  
 
 # PROPERTY VALUE LOADERS
 
@@ -895,6 +988,21 @@ property_tags = {
   0x3F08: ('INITIAL_DETAILS_PANE', 'I4'),
   0x3FDE: ('PR_INTERNET_CPID', 'I4'),
   0x3FFD: ('PR_MESSAGE_CODEPAGE', 'I4'),
+  # added 
+  0x1035: ("PR_INTERNET_MESSAGE_ID", "STRING"),
+  0x1080: ("PR_ICON_INDEX", "I4"),
+  0x1081: ("PR_LAST_VERB_EXECUTED", "I4"),
+  0x3016: ("PR_CONVERSATION_INDEX_TRACKING", "BOOLEAN"),
+  0x3ffa: ("PR_LAST_MODIFIER_NAME", "STRING"),
+  0x680d: ("UNKNOWN_0x680d", ""),
+  0x680e: ("UNKNOWN_0x680e", ""),
+  0x8000: ("UNKNOWN_0x8000",""),
+  0x8001: ("UNKNOWN_0x8001",""),
+  0x8002: ("UNKNOWN_0x8002",""),
+  0x8003: ("UNKNOWN_0x8003",""),
+  0x1016: ("PR_NATIVE_BODY_INFO", ""),
+  0x65e2: ("PR_CHANGE_KEY", "BINARY"),
+  0x65e3: ("PR_PREDECESSOR_CHANGE_LIST", "BINARY"),
 }
 
 code_pages = {
